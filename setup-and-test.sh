@@ -75,6 +75,8 @@ echo "Database setup complete."
 echo "Starting the application..."
 ./target/release/task_queue_system &
 APP_PID=$!
+echo "Application started with PID: $APP_PID"
+echo $APP_PID > app.pid
 
 # Wait for the application to start
 echo "Waiting for the application to start..."
@@ -216,10 +218,40 @@ echo ""
 # Ask if user wants to stop the application and database
 read -p "Do you want to stop the application and database? (y/n): " STOP_CHOICE
 if [[ $STOP_CHOICE == "y" || $STOP_CHOICE == "Y" ]]; then
-  # Stop the application
-  echo "Stopping the application..."
-  kill $APP_PID 2>/dev/null || true
-
+  # Get the PID - either from variable or from file as fallback
+  if [ -z "$APP_PID" ]; then
+    echo "APP_PID not found in environment, trying to read from file..."
+    if [ -f "app.pid" ]; then
+      APP_PID=$(cat app.pid)
+      echo "Found PID: $APP_PID from file"
+    fi
+  fi
+  
+  # Check if the process exists before trying to kill it
+  if [ -n "$APP_PID" ] && ps -p $APP_PID > /dev/null; then
+    echo "Stopping the application with graceful shutdown (PID: $APP_PID)..."
+    kill $APP_PID
+    
+    # Wait for the application to stop
+    for i in {1..10}; do
+      if ! ps -p $APP_PID > /dev/null; then
+        echo "Application stopped successfully."
+        break
+      fi
+      echo "Waiting for application to stop... ($i/10)"
+      sleep 1
+      if [ $i -eq 10 ]; then
+        echo "Application is taking too long to stop. Force killing..."
+        kill -9 $APP_PID 2>/dev/null || true
+      fi
+    done
+  else
+    echo "Application process (PID: $APP_PID) not found or already stopped."
+  fi
+  
+  # Clean up PID file
+  rm -f app.pid
+  
   # Stop and remove the database
   echo "Stopping and removing the database..."
   docker-compose down
@@ -227,7 +259,7 @@ if [[ $STOP_CHOICE == "y" || $STOP_CHOICE == "Y" ]]; then
   echo "Cleanup completed."
 else
   echo "The application and database are still running."
-  echo "To stop the application manually, run: kill $APP_PID"
+  echo "To stop the application manually, run: kill $([ -n "$APP_PID" ] && echo "$APP_PID" || echo "$(cat app.pid 2>/dev/null)")"
   echo "To stop the database, run: docker-compose down"
 fi
 

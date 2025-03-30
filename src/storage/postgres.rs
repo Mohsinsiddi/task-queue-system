@@ -15,8 +15,8 @@ impl PostgresDatabase {
     pub async fn new(database_url: &str) -> AppResult<Self> {
         // Add connection timeout and retry logic
         let pool = PgPoolOptions::new()
-            .max_connections(5)
-            .acquire_timeout(Duration::from_secs(5))
+            .max_connections(20)
+            .acquire_timeout(Duration::from_secs(15))
             .connect(database_url)
             .await
             .map_err(|e| {
@@ -300,84 +300,97 @@ impl Database for PostgresDatabase {
     }
 
     async fn get_scheduled_tasks(&self, before: DateTime<Utc>) -> AppResult<Vec<Task>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                id, name, payload, state, priority,
-                created_at, updated_at, scheduled_at,
-                started_at, completed_at, attempts,
-                max_attempts, last_error, worker_id,
-                result, tags
-            FROM tasks
-            WHERE state = 'scheduled' AND scheduled_at <= $1
-            ORDER BY priority DESC, scheduled_at ASC
-            "#
-        )
-        .bind(&before)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| AppError::DatabaseError(e))?;
-
-        let mut tasks = Vec::new();
-        for row in rows {
-            let id: String = row.try_get("id")?;
-            let name: String = row.try_get("name")?;
-            let payload: serde_json::Value = row.try_get("payload")?;
-            let state_str: String = row.try_get("state")?;
-            let priority_str: String = row.try_get("priority")?;
-            let created_at: DateTime<Utc> = row.try_get("created_at")?;
-            let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
-            let scheduled_at: Option<DateTime<Utc>> = row.try_get("scheduled_at")?;
-            let started_at: Option<DateTime<Utc>> = row.try_get("started_at")?;
-            let completed_at: Option<DateTime<Utc>> = row.try_get("completed_at")?;
-            let attempts: i32 = row.try_get("attempts")?;
-            let max_attempts: i32 = row.try_get("max_attempts")?;
-            let last_error: Option<String> = row.try_get("last_error")?;
-            let worker_id: Option<String> = row.try_get("worker_id")?;
-            let result: Option<serde_json::Value> = row.try_get("result")?;
-            let tags: Vec<String> = row.try_get("tags").unwrap_or_default();
-
-            let state = match state_str.as_str() {
-                "pending" => TaskState::Pending,
-                "scheduled" => TaskState::Scheduled,
-                "running" => TaskState::Running,
-                "completed" => TaskState::Completed,
-                "failed" => TaskState::Failed,
-                "cancelled" => TaskState::Cancelled,
-                _ => TaskState::Pending,
-            };
-
-            let priority = match priority_str.as_str() {
-                "low" => TaskPriority::Low,
-                "medium" => TaskPriority::Medium,
-                "high" => TaskPriority::High,
-                "critical" => TaskPriority::Critical,
-                _ => TaskPriority::Medium,
-            };
-
-            tasks.push(Task {
-                id,
-                name,
-                payload,
-                state,
-                priority,
-                created_at,
-                updated_at,
-                scheduled_at,
-                started_at,
-                completed_at,
-                attempts: attempts as u32,
-                max_attempts: max_attempts as u32,
-                last_error,
-                worker_id,
-                result,
-                tags,
-            });
+        // Set a timeout for this operation
+        const TIMEOUT_SECONDS: u64 = 5;
+        
+        // Use a timeout wrapper around the database operation
+        match tokio::time::timeout(
+            Duration::from_secs(TIMEOUT_SECONDS),
+            async {
+                let rows = sqlx::query(
+                    r#"
+                    SELECT
+                        id, name, payload, state, priority,
+                        created_at, updated_at, scheduled_at,
+                        started_at, completed_at, attempts,
+                        max_attempts, last_error, worker_id,
+                        result, tags
+                    FROM tasks
+                    WHERE state = 'scheduled' AND scheduled_at <= $1
+                    ORDER BY priority DESC, scheduled_at ASC
+                    "#
+                )
+                .bind(&before)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| AppError::DatabaseError(e))?;
+    
+                // Process the results and convert to Task objects
+                let mut tasks = Vec::new();
+                for row in rows {
+                    // [Extract task data from row - existing code]
+                    let id: String = row.try_get("id")?;
+                    let name: String = row.try_get("name")?;
+                    let payload: serde_json::Value = row.try_get("payload")?;
+                    let state_str: String = row.try_get("state")?;
+                    let priority_str: String = row.try_get("priority")?;
+                    // [Rest of your existing field extraction]
+                    
+                    // [Create Task object - existing code]
+                    let state = match state_str.as_str() {
+                        // [Your existing state mapping code]
+                        "pending" => TaskState::Pending,
+                        "scheduled" => TaskState::Scheduled,
+                        "running" => TaskState::Running,
+                        "completed" => TaskState::Completed,
+                        "failed" => TaskState::Failed,
+                        "cancelled" => TaskState::Cancelled,
+                        _ => TaskState::Pending,
+                    };
+    
+                    let priority = match priority_str.as_str() {
+                        // [Your existing priority mapping code]
+                        "low" => TaskPriority::Low,
+                        "medium" => TaskPriority::Medium,
+                        "high" => TaskPriority::High,
+                        "critical" => TaskPriority::Critical,
+                        _ => TaskPriority::Medium,
+                    };
+    
+                    tasks.push(Task {
+                        id,
+                        name,
+                        payload,
+                        state,
+                        priority,
+                        // [Rest of your Task construction]
+                        created_at: row.try_get("created_at")?,
+                        updated_at: row.try_get("updated_at")?,
+                        scheduled_at: row.try_get("scheduled_at")?,
+                        started_at: row.try_get("started_at")?,
+                        completed_at: row.try_get("completed_at")?,
+                        attempts: row.try_get::<i32, _>("attempts")? as u32,
+                        max_attempts: row.try_get::<i32, _>("max_attempts")? as u32,
+                        last_error: row.try_get("last_error")?,
+                        worker_id: row.try_get("worker_id")?,
+                        result: row.try_get("result")?,
+                        tags: row.try_get("tags").unwrap_or_default(),
+                    });
+                }
+    
+                Ok(tasks)
+            }
+        ).await {
+            // Timeout wrapper result handling
+            Ok(result) => result, // Propagate the inner result
+            Err(_) => {
+                // Operation timed out
+                warn!("Database operation timed out in get_scheduled_tasks");
+                Ok(Vec::new()) // Return empty vector instead of failing the scheduler
+            }
         }
-
-        Ok(tasks)
     }
-
+    
     async fn get_failed_tasks_for_retry(&self) -> AppResult<Vec<Task>> {
         let rows = sqlx::query(
             r#"

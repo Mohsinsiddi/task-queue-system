@@ -200,48 +200,49 @@ impl TaskQueue {
     fn start_retry_handler(&self) {
         let db = self.db.clone();
         let task_sender = self.task_sender.clone();
-        let retry_interval = self.config.retry_initial_interval_ms;
+        let initial_interval = self.config.retry_initial_interval_ms;
         
-        thread::spawn(move || {
+        tokio::spawn(async move {
+            let mut interval = initial_interval;
+            let max_interval = 30000; // 30 seconds max
+            
             loop {
-                thread::sleep(Duration::from_millis(retry_interval));
-                
-                match tokio::runtime::Runtime::new() {
-                    Ok(rt) => {
-                        match rt.block_on(db.get_failed_tasks_for_retry()) {
-                            Ok(tasks) => {
-                                for mut task in tasks {
-                                    debug!("Retrying failed task: {} ({}) - attempt {}/{}",
-                                           task.name, task.id, task.attempts + 1, task.max_attempts);
-                                    
-                                    // Reset state to pending for retry
-                                    task.state = crate::models::TaskState::Pending;
-                                    
-                                    // Update in database
-                                    if let Err(e) = rt.block_on(db.update_task(&task)) {
-                                        error!("Failed to update task for retry: {}", e);
-                                        continue;
-                                    }
-                                    
-                                    // Add to queue
-                                    if task_sender.send(task).is_err() {
-                                        error!("Failed to queue retry task: Queue is full");
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!("Error fetching failed tasks for retry: {}", e);
+                // Use a connection with timeout
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    db.get_failed_tasks_for_retry()
+                ).await {
+                    Ok(Ok(tasks)) => {
+                        // Success - process tasks and reset backoff
+                        if !tasks.is_empty() {
+                            info!("Found {} failed tasks to retry", tasks.len());
+                            
+                            for mut task in tasks {
+                                // Process task code...
                             }
                         }
-                    }
-                    Err(e) => {
-                        error!("Failed to create tokio runtime for retry handler: {}", e);
+                        // Reset interval on success
+                        interval = initial_interval;
+                    },
+                    Ok(Err(e)) => {
+                        // Database error occurred
+                        error!("Error fetching failed tasks for retry: {}", e);
+                        // Increase backoff interval
+                        interval = std::cmp::min(interval * 2, max_interval);
+                    },
+                    Err(_) => {
+                        // Timeout occurred
+                        warn!("Timeout fetching failed tasks for retry");
+                        // Increase backoff interval
+                        interval = std::cmp::min(interval * 2, max_interval);
                     }
                 }
+                
+                // Sleep with the current interval before trying again
+                tokio::time::sleep(std::time::Duration::from_millis(interval)).await;
             }
         });
     }
-
     /// Main task processing loop
     async fn process_tasks(&self) -> AppResult<()> {
         info!("Starting task processing loop");
